@@ -1,6 +1,6 @@
 # Ubuntu file explorer in Rust
 
-A simple, read-only file explorer for Ubuntu 26.04.1, written in Rust. You can navigate directories, filter files, and preview text.
+A simple, read-only file explorer for Ubuntu 26.04.1, written in Rust. Browse directories, see file types and sizes, filter by name, and preview text with line numbers.
 
 You'll need Rust and Cargo to build it.
 
@@ -21,5 +21,6 @@ cargo run --locked -- /path/to/directory
 | `/` | Filter by name as you type. Enter applies the filter, and Esc clears it |
 | `.` | Toggle dotfiles |
 | `r` | Refresh the current directory |
+| `w` | Toggle line wrapping in the preview |
 | `q` | Leave the preview or quit from the file list |
 | Ctrl+C | Quit |

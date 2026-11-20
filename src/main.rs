@@ -1,23 +1,24 @@
 mod files;
+mod view;
 
 use std::{
     env,
     ffi::OsStr,
-    io::{self, IsTerminal, Write},
-    path::{Path, PathBuf},
+    io::{self, BufWriter, IsTerminal},
+    path::PathBuf,
     process::ExitCode,
 };
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute, queue,
-    style::{Attribute, Print, SetAttribute},
+    execute,
+    style::{Attribute, SetAttribute},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use unicode_width::UnicodeWidthChar;
 
-use files::{Entry, Preview, visible_text};
+use files::Entry;
+use view::{OpenPreview, View};
 
 const USAGE: &str = "Usage: rustexplorer [directory]";
 
@@ -123,11 +124,7 @@ impl Explorer {
             return None;
         }
         match files::preview(&path) {
-            Ok(preview) => Some(OpenPreview {
-                path,
-                preview,
-                top: 0,
-            }),
+            Ok(preview) => Some(OpenPreview::new(path, preview)),
             Err(error) => {
                 self.status = error.to_string();
                 None
@@ -194,213 +191,6 @@ impl Explorer {
     }
 }
 
-struct OpenPreview {
-    path: PathBuf,
-    preview: Preview,
-    top: usize,
-}
-
-impl OpenPreview {
-    fn scroll(&mut self, key: KeyCode, height: usize) {
-        self.top = match key {
-            KeyCode::Up | KeyCode::Char('k') => self.top.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.top.saturating_add(1),
-            KeyCode::PageUp => self.top.saturating_sub(height),
-            KeyCode::PageDown => self.top.saturating_add(height),
-            KeyCode::Home | KeyCode::Char('g') => 0,
-            // Drawing clamps this to the last page once the text is wrapped.
-            KeyCode::End | KeyCode::Char('G') => usize::MAX,
-            _ => self.top,
-        };
-    }
-}
-
-struct View {
-    width: usize,
-    rows: u16,
-}
-
-impl View {
-    fn new() -> io::Result<Self> {
-        let (columns, rows) = terminal::size()?;
-        Ok(Self {
-            // Leave the last column free so printing a full row won't wrap.
-            width: usize::from(columns.saturating_sub(1)),
-            rows,
-        })
-    }
-
-    fn height(&self) -> usize {
-        usize::from(self.rows.saturating_sub(5))
-    }
-
-    fn line(&self, out: &mut impl Write, y: u16, text: &str, style: Attribute) -> io::Result<()> {
-        let mut columns = 0;
-        let end = text
-            .char_indices()
-            .find(|&(_, ch)| {
-                columns += ch.width().unwrap_or(0);
-                columns > self.width
-            })
-            .map_or(text.len(), |(offset, _)| offset);
-        queue!(
-            out,
-            MoveTo(0, y),
-            SetAttribute(style),
-            Print(&text[..end]),
-            SetAttribute(Attribute::Reset)
-        )
-    }
-
-    fn draw(
-        &self,
-        out: &mut impl Write,
-        explorer: &mut Explorer,
-        preview: Option<&mut OpenPreview>,
-    ) -> io::Result<()> {
-        queue!(out, Clear(ClearType::All))?;
-        if self.height() == 0 || self.width < 12 {
-            if self.rows > 0 {
-                self.line(out, 0, "Resize terminal (q quits)", Attribute::Reset)?;
-            }
-        } else if let Some(preview) = preview {
-            self.draw_preview(out, preview)?;
-        } else {
-            self.draw_directory(out, explorer)?;
-        }
-        out.flush()
-    }
-
-    fn draw_directory(&self, out: &mut impl Write, explorer: &mut Explorer) -> io::Result<()> {
-        let path = display_path(&explorer.directory, self.width.saturating_sub(6));
-        self.line(out, 0, &format!("Files  {path}"), Attribute::Bold)?;
-
-        let height = self.height();
-        explorer.scroll.keep_visible(explorer.matches.len(), height);
-        let top = explorer.scroll.top;
-        for (y, &index) in explorer.matches.iter().skip(top).take(height).enumerate() {
-            let entry = &explorer.entries[index];
-            let selected = top + y == explorer.scroll.selected;
-            let marker = if selected { "> " } else { "  " };
-            let style = if selected {
-                Attribute::Reverse
-            } else if entry.directory {
-                Attribute::Bold
-            } else {
-                Attribute::Reset
-            };
-            self.line(
-                out,
-                y as u16 + 2,
-                &format!("{marker}{}", entry.label),
-                style,
-            )?;
-        }
-        if explorer.matches.is_empty() {
-            let message = if explorer.filter.is_empty() {
-                "  Empty directory"
-            } else {
-                "  No matches"
-            };
-            self.line(out, 2, message, Attribute::Reset)?;
-        }
-
-        let status = if explorer.editing_filter {
-            format!("/{}_", visible_text(&explorer.filter))
-        } else if !explorer.status.is_empty() {
-            visible_text(&explorer.status)
-        } else if !explorer.filter.is_empty() {
-            format!(
-                "/{}  ·  {} matches  ·  Esc clear",
-                visible_text(&explorer.filter),
-                explorer.matches.len()
-            )
-        } else {
-            let hidden = if explorer.show_hidden {
-                "shown"
-            } else {
-                "hidden"
-            };
-            format!("{} entries  ·  dotfiles {hidden}", explorer.entries.len())
-        };
-        self.line(out, self.rows - 3, &status, Attribute::Reset)?;
-        let (first, second) = if explorer.editing_filter {
-            ("Type to filter  ·  ↑↓ select", "Enter apply  ·  Esc clear")
-        } else {
-            (
-                "↑↓ / jk move  ·  Enter open  ·  ← / h parent",
-                "/ filter  ·  . hidden  ·  r reload  ·  q quit",
-            )
-        };
-        self.line(out, self.rows - 2, first, Attribute::Reset)?;
-        self.line(out, self.rows - 1, second, Attribute::Reset)
-    }
-
-    fn draw_preview(&self, out: &mut impl Write, open: &mut OpenPreview) -> io::Result<()> {
-        let path = display_path(&open.path, self.width.saturating_sub(9));
-        self.line(out, 0, &format!("Preview  {path}"), Attribute::Bold)?;
-
-        let lines = preview_lines(&open.preview.text, self.width);
-        let height = self.height();
-        open.top = open.top.min(lines.len().saturating_sub(height));
-        for (y, line) in lines.iter().skip(open.top).take(height).enumerate() {
-            self.line(out, y as u16 + 2, line, Attribute::Reset)?;
-        }
-        let end = (open.top + height).min(lines.len());
-        let status = if lines.is_empty() {
-            "Empty file".to_owned()
-        } else {
-            let limit = if open.preview.truncated {
-                "  ·  first 64 KiB"
-            } else {
-                ""
-            };
-            format!("{}–{end} of {} rows{limit}", open.top + 1, lines.len())
-        };
-        self.line(out, self.rows - 3, &status, Attribute::Reset)?;
-        self.line(
-            out,
-            self.rows - 2,
-            "↑↓ / jk scroll  ·  PgUp/PgDn page",
-            Attribute::Reset,
-        )?;
-        self.line(out, self.rows - 1, "Esc / ← / q back", Attribute::Reset)
-    }
-}
-
-fn display_path(path: &Path, width: usize) -> String {
-    let path = visible_text(&path.to_string_lossy());
-    let mut remaining = width;
-    for (offset, ch) in path.char_indices().rev() {
-        let columns = ch.width().unwrap_or(0);
-        if columns > remaining || (offset != 0 && columns == remaining) {
-            return format!("…{}", &path[offset + ch.len_utf8()..]);
-        }
-        remaining -= columns;
-    }
-    path
-}
-
-fn preview_lines(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for raw in text.lines() {
-        let clean = visible_text(&raw.replace('\t', "    "));
-        let mut start = 0;
-        let mut columns = 0;
-        for (offset, ch) in clean.char_indices() {
-            let cell_width = ch.width().unwrap_or(0);
-            if columns + cell_width > width {
-                lines.push(clean[start..offset].to_owned());
-                start = offset;
-                columns = 0;
-            }
-            columns += cell_width;
-        }
-        lines.push(clean[start..].to_owned());
-    }
-    lines
-}
-
 struct Terminal;
 
 impl Terminal {
@@ -435,7 +225,7 @@ fn run(mut explorer: Explorer) -> io::Result<()> {
         return Err(io::Error::other("An interactive terminal is required."));
     }
     let _terminal = Terminal::enter()?;
-    let mut out = io::stdout().lock();
+    let mut out = BufWriter::with_capacity(32 * 1024, io::stdout().lock());
     let mut preview = None::<OpenPreview>;
     loop {
         let view = View::new()?;
@@ -454,12 +244,12 @@ fn run(mut explorer: Explorer) -> io::Result<()> {
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h' | 'q') => {
                     preview = None;
                 }
-                code => open.scroll(code, view.height()),
+                code => open.handle_key(code, view.height(true)),
             }
         } else if key.code == KeyCode::Char('q') && !explorer.editing_filter {
             return Ok(());
         } else {
-            preview = explorer.handle_key(key, view.height());
+            preview = explorer.handle_key(key, view.height(false));
         }
     }
 }

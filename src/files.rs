@@ -14,7 +14,8 @@ pub struct Entry {
     pub search_name: String,
     pub label: String,
     pub directory: bool,
-    hidden: bool,
+    pub kind: &'static str,
+    pub size: Option<u64>,
 }
 
 pub fn list(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
@@ -23,6 +24,9 @@ pub fn list(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
         let item = item?;
         let name = item.file_name();
         let filename = name.to_string_lossy();
+        if !show_hidden && filename.starts_with('.') {
+            continue;
+        }
         let kind = item.file_type().ok();
         let link = kind.is_some_and(|kind| kind.is_symlink());
         let directory = if link {
@@ -36,15 +40,30 @@ pub fn list(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
             (false, true) => "@",
             (false, false) => "",
         };
+        let regular = kind.is_some_and(|kind| kind.is_file());
+        let label_kind = if link {
+            "Link"
+        } else if directory {
+            "Folder"
+        } else if regular {
+            "File"
+        } else {
+            "Other"
+        };
+        let size = if regular {
+            item.metadata().ok().map(|metadata| metadata.len())
+        } else {
+            None
+        };
         entries.push(Entry {
             search_name: filename.to_lowercase(),
             label: format!("{}{suffix}", visible_text(&filename)),
             directory,
-            hidden: filename.starts_with('.'),
+            kind: label_kind,
+            size,
             name,
         });
     }
-    entries.retain(|entry| show_hidden || !entry.hidden);
     entries.sort_unstable_by(|a, b| {
         b.directory
             .cmp(&a.directory)
